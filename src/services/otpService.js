@@ -1,4 +1,5 @@
 import { user_model } from '../model/user_model.js';
+import { pending_user_model } from '../model/pending_user_model.js';
 import { generateOTP, hashOTP, isOTPExpired, getBlockDuration,formatRemainingTime,getOTPExpiryTime,isValidOTP,checkBlockStatus} from '../utils/otplock.js';
 import { sendOTPVerificationEmail, sendResetPasswordOTPEmail, sendWelcomeEmail } from '../mail/allmailformate.js';
 
@@ -383,6 +384,213 @@ class OTPService {
             };
 
             return status;
+        } catch (error) {
+            throw error;
+        }
+    }
+
+    /**
+     * Send OTP for Pending Registration (Account NOT created until verified)
+     */
+    static async sendRegistrationOTP(userData) {
+        try {
+            const { fname, lname, email, password, gender, mobile } = userData;
+
+            // Check if account already exists
+            const existingUser = await user_model.findOne({ email });
+            if (existingUser) {
+                throw new Error('User already exists with this email');
+            }
+
+            // Check if there is an existing pending registration
+            let pending = await pending_user_model.findOne({ email });
+            if (pending) {
+                const blockStatus = checkBlockStatus(pending.otpLockUntil);
+                if (blockStatus.isBlocked) {
+                    throw new Error(`Too many attempts. Please try again after ${blockStatus.remaining}`);
+                }
+            }
+
+            const otp = generateOTP();
+            const hashedOTP = hashOTP(otp);
+            const otpExpiryTime = getOTPExpiryTime();
+
+            // Save to pending collection
+            await pending_user_model.findOneAndUpdate(
+                { email },
+                {
+                    fname,
+                    lname,
+                    email,
+                    password,
+                    gender,
+                    mobile: mobile || undefined,
+                    otp: hashedOTP,
+                    otpExpiryTime,
+                    otpAtm: 3,
+                    otpLockUntil: null,
+                    otpLockStage: -1
+                },
+                { upsert: true, returnDocument: 'after', runValidators: true }
+            );
+
+            // Send verification email
+            await sendOTPVerificationEmail(fname, email, otp);
+
+            return {
+                success: true,
+                message: 'Verification OTP sent to your email. Please authenticate to complete account creation.',
+                email,
+                expiryTime: otpExpiryTime
+            };
+        } catch (error) {
+            throw error;
+        }
+    }
+
+    /**
+     * Verify OTP and CREATE the account
+     */
+    static async verifyRegistrationOTP(email, enteredOTP) {
+        try {
+            if (!isValidOTP(enteredOTP)) {
+                throw new Error('Invalid OTP format. Please enter a 6-digit number');
+            }
+
+            const pending = await pending_user_model.findOne({ email });
+            if (!pending) {
+                throw new Error('No pending registration found or verification session expired. Please register again.');
+            }
+
+            // Check if blocked
+            const blockStatus = checkBlockStatus(pending.otpLockUntil);
+            if (blockStatus.isBlocked) {
+                throw new Error(`Too many attempts. Please try again after ${blockStatus.remaining}`);
+            }
+
+            // Check expiration
+            if (isOTPExpired(pending.otpExpiryTime)) {
+                throw new Error('OTP has expired. Please request a new one');
+            }
+
+            // Verify hash
+            const hashedEnteredOTP = hashOTP(enteredOTP);
+            const isMatch = pending.otp === hashedEnteredOTP;
+
+            if (!isMatch) {
+                pending.otpAtm -= 1;
+
+                if (pending.otpAtm <= 0) {
+                    pending.otpLockStage += 1;
+                    const blockDuration = getBlockDuration(pending.otpLockStage);
+                    pending.otpLockUntil = Date.now() + blockDuration;
+                    pending.otpAtm = 3;
+                    await pending.save();
+
+                    const remaining = formatRemainingTime(pending.otpLockUntil);
+                    throw new Error(`Too many failed attempts. You are blocked for ${remaining}`);
+                }
+
+                await pending.save();
+                throw new Error(`Invalid OTP. You have ${pending.otpAtm} attempt${pending.otpAtm > 1 ? 's' : ''} remaining`);
+            }
+
+            // OTP is correct -> NOW CREATE USER ACCOUNT IN DB
+            const user = await user_model.create({
+                fname: pending.fname,
+                lname: pending.lname,
+                email: pending.email,
+                password: pending.password,
+                gender: pending.gender,
+                mobile: pending.mobile,
+                verification: {
+                    user: {
+                        isVerify: true,
+                        verifiedAt: new Date()
+                    }
+                }
+            });
+
+            // Remove from pending collection
+            await pending_user_model.deleteOne({ _id: pending._id });
+
+            // Send welcome email
+            try {
+                await sendWelcomeEmail(user.fname, user.email);
+            } catch (mailErr) {
+                console.error('Welcome email error:', mailErr.message);
+            }
+
+            return {
+                success: true,
+                message: 'Royal account created and email verified successfully!',
+                user
+            };
+        } catch (error) {
+            throw error;
+        }
+    }
+
+    /**
+     * Resend OTP for Pending Registration
+     */
+    static async resendRegistrationOTP(email) {
+        try {
+            const pending = await pending_user_model.findOne({ email });
+            if (!pending) {
+                throw new Error('No pending registration found. Please register your details first.');
+            }
+
+            const blockStatus = checkBlockStatus(pending.otpLockUntil);
+            if (blockStatus.isBlocked) {
+                throw new Error(`Too many attempts. Please try again after ${blockStatus.remaining}`);
+            }
+
+            const otp = generateOTP();
+            const hashedOTP = hashOTP(otp);
+            const otpExpiryTime = getOTPExpiryTime();
+
+            pending.otp = hashedOTP;
+            pending.otpExpiryTime = otpExpiryTime;
+            pending.otpAtm = 3;
+            await pending.save();
+
+            await sendOTPVerificationEmail(pending.fname, pending.email, otp);
+
+            return {
+                success: true,
+                message: 'New OTP sent to your registered royal email!',
+                expiryTime: otpExpiryTime
+            };
+        } catch (error) {
+            throw error;
+        }
+    }
+
+    /**
+     * Get Pending Registration OTP Status
+     */
+    static async getRegistrationOTPStatus(email) {
+        try {
+            const pending = await pending_user_model.findOne({ email });
+            if (!pending) {
+                return {
+                    hasPending: false
+                };
+            }
+
+            return {
+                hasPending: true,
+                isVerified: false,
+                otpStatus: {
+                    hasOTP: !!pending.otp,
+                    isExpired: isOTPExpired(pending.otpExpiryTime),
+                    remainingAttempts: pending.otpAtm || 0,
+                    isBlocked: pending.otpLockUntil ? pending.otpLockUntil > Date.now() : false,
+                    blockRemaining: pending.otpLockUntil ? formatRemainingTime(pending.otpLockUntil) : null,
+                    expiryTime: pending.otpExpiryTime
+                }
+            };
         } catch (error) {
             throw error;
         }

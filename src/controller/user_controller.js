@@ -1,6 +1,7 @@
 import { user_model } from '../model/user_model.js';
 import OTPService from '../services/otpService.js';
 import { error_handling, AppError } from '../middleware/allerror.js';
+import { profile_img, delete_profile_img } from '../img/profileimg.js';
 import jwt from 'jsonwebtoken';
 import dotenv from 'dotenv';
 
@@ -57,7 +58,7 @@ const sendTokenResponse = (user, statusCode, res) => {
 // ==================== AUTH CONTROLLERS ====================
 
 /**
- * @desc    Register User
+ * @desc    Initiate Registration (Sends OTP, User NOT saved to DB until OTP verified)
  * @route   POST /api/v1/auth/register
  * @access  Public
  */
@@ -70,30 +71,86 @@ export const register = async (req, res) => {
             throw new AppError('Please provide all required fields: fname, lname, email, password, gender', 400);
         }
 
-        // Check if user exists
-        const existingUser = await user_model.findOne({ email });
-        if (existingUser) {
-            throw new AppError('User already exists with this email', 400);
-        }
-
-        // Create user
-        const user = await user_model.create({
+        const result = await OTPService.sendRegistrationOTP({
             fname,
             lname,
-            email,
+            email: email.toLowerCase().trim(),
             password,
             gender,
             mobile: mobile || undefined
         });
 
-        // Send OTP (await to catch errors)
-        try {
-            await OTPService.sendVerificationOTP(user._id);
-        } catch (otpError) {
-            console.error('OTP send error (user still created):', otpError.message);
+        res.status(200).json({
+            success: true,
+            message: result.message,
+            email: result.email,
+            expiryTime: result.expiryTime
+        });
+    } catch (error) {
+        error_handling(error, res);
+    }
+};
+
+/**
+ * @desc    Verify Registration OTP and Create User Account
+ * @route   POST /api/v1/auth/verify-registration-otp
+ * @access  Public
+ */
+export const verifyRegistrationOTP = async (req, res) => {
+    try {
+        const { email, otp } = req.body;
+
+        if (!email || !otp) {
+            throw new AppError('Please provide both email and OTP', 400);
         }
 
-        sendTokenResponse(user, 201, res);
+        const result = await OTPService.verifyRegistrationOTP(email.toLowerCase().trim(), otp);
+        sendTokenResponse(result.user, 201, res);
+    } catch (error) {
+        error_handling(error, res);
+    }
+};
+
+/**
+ * @desc    Resend Registration OTP
+ * @route   POST /api/v1/auth/resend-registration-otp
+ * @access  Public
+ */
+export const resendRegistrationOTP = async (req, res) => {
+    try {
+        const { email } = req.body;
+
+        if (!email) {
+            throw new AppError('Please provide email', 400);
+        }
+
+        const result = await OTPService.resendRegistrationOTP(email.toLowerCase().trim());
+        res.status(200).json({
+            success: true,
+            data: result
+        });
+    } catch (error) {
+        error_handling(error, res);
+    }
+};
+
+/**
+ * @desc    Get Registration OTP Status
+ * @route   GET /api/v1/auth/registration-otp-status
+ * @access  Public
+ */
+export const getRegistrationOTPStatus = async (req, res) => {
+    try {
+        const email = req.query.email;
+        if (!email) {
+            throw new AppError('Please provide email', 400);
+        }
+
+        const result = await OTPService.getRegistrationOTPStatus(email.toLowerCase().trim());
+        res.status(200).json({
+            success: true,
+            data: result
+        });
     } catch (error) {
         error_handling(error, res);
     }
@@ -348,6 +405,44 @@ export const updateProfile = async (req, res) => {
         res.status(200).json({
             success: true,
             data: user
+        });
+    } catch (error) {
+        error_handling(error, res);
+    }
+};
+
+/**
+ * @desc    Upload Profile Image
+ * @route   PUT /api/v1/auth/upload-profile-image
+ * @access  Private
+ */
+export const uploadProfileImage = async (req, res) => {
+    try {
+        if (!req.file) {
+            throw new AppError('Please upload an image', 400);
+        }
+
+        const user = await user_model.findById(req.user._id);
+        if (!user) {
+            throw new AppError('User not found', 404);
+        }
+
+        // Delete old profile image if exists
+        if (user.avatar && user.avatar.public_id) {
+            await delete_profile_img(user.avatar.public_id);
+        }
+
+        // Upload new image
+        const uploadResult = await profile_img(req.file.buffer);
+
+        // Update user
+        user.avatar = uploadResult;
+        await user.save();
+
+        res.status(200).json({
+            success: true,
+            message: 'Profile image uploaded successfully',
+            data: { avatar: uploadResult }
         });
     } catch (error) {
         error_handling(error, res);
